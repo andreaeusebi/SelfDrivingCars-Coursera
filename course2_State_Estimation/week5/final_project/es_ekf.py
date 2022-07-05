@@ -8,13 +8,16 @@ import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 from rotations import angle_normalize, rpy_jacobian_axis_angle, skew_symmetric, Quaternion
 
+#### 0. Global Variables #######################################################################
+PLOT = True
+
 #### 1. Data ###################################################################################
 
 ################################################################################################
 # This is where you will load the data from the pickle files. For parts 1 and 2, you will use
 # p1_data.pkl. For Part 3, you will use pt3_data.pkl.
 ################################################################################################
-with open('data/pt1_data.pkl', 'rb') as file:
+with open('data/pt3_data.pkl', 'rb') as file:
     data = pickle.load(file)
 
 ################################################################################################
@@ -51,15 +54,16 @@ lidar = data['lidar']
 # Let's plot the ground truth trajectory to see what it looks like. When you're testing your
 # code later, feel free to comment this out.
 ################################################################################################
-gt_fig = plt.figure()
-ax = gt_fig.add_subplot(111, projection='3d')
-ax.plot(gt.p[:,0], gt.p[:,1], gt.p[:,2])
-ax.set_xlabel('x [m]')
-ax.set_ylabel('y [m]')
-ax.set_zlabel('z [m]')
-ax.set_title('Ground Truth trajectory')
-ax.set_zlim(-1, 5)
-plt.show()
+if (PLOT) :
+    gt_fig = plt.figure()
+    ax = gt_fig.add_subplot(111, projection='3d')
+    ax.plot(gt.p[:,0], gt.p[:,1], gt.p[:,2])
+    ax.set_xlabel('x [m]')
+    ax.set_ylabel('y [m]')
+    ax.set_zlabel('z [m]')
+    ax.set_title('Ground Truth trajectory')
+    ax.set_zlim(-1, 5)
+    plt.show()
 
 ################################################################################################
 # Remember that our LIDAR data is actually just a set of positions estimated from a separate
@@ -101,6 +105,9 @@ var_imu_w = 0.25
 var_gnss  = 0.01
 var_lidar = 1.00
 
+gnss_cov_mat = np.identity(3) * var_gnss
+lidar_cov_mat = np.identity(3) * var_lidar
+
 ################################################################################################
 # We can also set up some constants that won't change for any iteration of our solver.
 ################################################################################################
@@ -136,12 +143,21 @@ lidar_i = 0
 ################################################################################################
 def measurement_update(sensor_var, p_cov_check, y_k, p_check, v_check, q_check):
     # 3.1 Compute Kalman Gain
+    # K is a 9x3 matrix
+    K = p_cov_check @ h_jac.T @ np.linalg.inv(h_jac @ p_cov_check @ h_jac.T + sensor_var)
 
     # 3.2 Compute error state
+    # x_error is a vector with 9 elements
+    x_error = K @ (y_k - p_check)
 
     # 3.3 Correct predicted state
+    p_hat = p_check + x_error[0:3]
+    v_hat = v_check + x_error[3:6]
+    quat_error = Quaternion(euler=x_error[6:9])
+    q_hat = quat_error.quat_mult_left(q_check)
 
     # 3.4 Compute corrected covariance
+    p_cov_hat = (np.identity(9) - K @ h_jac) @ p_cov_check
 
     return p_hat, v_hat, q_hat, p_cov_hat
 
@@ -151,16 +167,45 @@ def measurement_update(sensor_var, p_cov_check, y_k, p_check, v_check, q_check):
 # Now that everything is set up, we can start taking in the sensor data and creating estimates
 # for our state in a loop.
 ################################################################################################
+gnss_idx = 0
+lidar_idx = 0
 for k in range(1, imu_f.data.shape[0]):  # start at 1 b/c we have initial prediction from gt
     delta_t = imu_f.t[k] - imu_f.t[k - 1]
 
     # 1. Update state with IMU inputs
+    rotation_mat_I_to_V = Quaternion(*q_est[k - 1]).to_mat()
+
+    p_est[k] = p_est[k - 1] + delta_t * v_est[k - 1] + 0.5 * (delta_t ** 2) * (rotation_mat_I_to_V @ imu_f.data[k - 1] + g)
+    v_est[k] = v_est[k - 1] + delta_t * (rotation_mat_I_to_V @ imu_f.data[k - 1] + g)
+    q_est[k] = Quaternion(euler=(imu_w.data[k - 1] * delta_t)).quat_mult_right(q_est[k - 1])
 
     # 1.1 Linearize the motion model and compute Jacobians
+    F = np.identity(9)
+    F[0:3, 3:6] = np.identity(3) * delta_t
+    F[3:6, 6:9] = - delta_t * skew_symmetric(rotation_mat_I_to_V @ imu_f.data[k - 1])
+
+    L = np.zeros([9, 6])
+    L[3:6, 0:3] = np.identity(3)
+    L[6:9, 3:6] = np.identity(3)
 
     # 2. Propagate uncertainty
+    imu_cov_mat = np.identity(6)
+    imu_cov_mat[0:3, 0:3] = np.identity(3) * var_imu_f * (delta_t ** 2)
+    imu_cov_mat[3:6, 3:6] = np.identity(3) * var_imu_w * (delta_t ** 2)
+
+    p_cov[k] = F @ p_cov[k - 1] @ F.T + L @ imu_cov_mat @ L.T
+
 
     # 3. Check availability of GNSS and LIDAR measurements
+    if (gnss_idx < np.shape(gnss.data)[0]) :
+        if (imu_f.t[k] >= gnss.t[gnss_idx]) :
+            [p_est[k], v_est[k], q_est[k], p_cov[k]] = measurement_update(gnss_cov_mat, p_cov[k], gnss.data[gnss_idx], p_est[k], v_est[k], q_est[k])
+            gnss_idx = gnss_idx + 1
+
+    if (lidar_idx < np.shape(lidar.data)[0]) :
+        if (imu_f.t[k] >= lidar.t[lidar_idx]) :
+            [p_est[k], v_est[k], q_est[k], p_cov[k]] = measurement_update(lidar_cov_mat, p_cov[k], lidar.data[lidar_idx], p_est[k], v_est[k], q_est[k])
+            lidar_idx = lidar_idx + 1
 
     # Update states (save)
 
@@ -172,66 +217,67 @@ for k in range(1, imu_f.data.shape[0]):  # start at 1 b/c we have initial predic
 # estimated trajectory continues past the ground truth. This is because we will be evaluating
 # your estimated poses from the part of the trajectory where you don't have ground truth!
 ################################################################################################
-est_traj_fig = plt.figure()
-ax = est_traj_fig.add_subplot(111, projection='3d')
-ax.plot(p_est[:,0], p_est[:,1], p_est[:,2], label='Estimated')
-ax.plot(gt.p[:,0], gt.p[:,1], gt.p[:,2], label='Ground Truth')
-ax.set_xlabel('Easting [m]')
-ax.set_ylabel('Northing [m]')
-ax.set_zlabel('Up [m]')
-ax.set_title('Ground Truth and Estimated Trajectory')
-ax.set_xlim(0, 200)
-ax.set_ylim(0, 200)
-ax.set_zlim(-2, 2)
-ax.set_xticks([0, 50, 100, 150, 200])
-ax.set_yticks([0, 50, 100, 150, 200])
-ax.set_zticks([-2, -1, 0, 1, 2])
-ax.legend(loc=(0.62,0.77))
-ax.view_init(elev=45, azim=-50)
-plt.show()
+if (PLOT) :
+    est_traj_fig = plt.figure()
+    ax = est_traj_fig.add_subplot(111, projection='3d')
+    ax.plot(p_est[:,0], p_est[:,1], p_est[:,2], label='Estimated')
+    ax.plot(gt.p[:,0], gt.p[:,1], gt.p[:,2], label='Ground Truth')
+    ax.set_xlabel('Easting [m]')
+    ax.set_ylabel('Northing [m]')
+    ax.set_zlabel('Up [m]')
+    ax.set_title('Ground Truth and Estimated Trajectory')
+    ax.set_xlim(0, 200)
+    ax.set_ylim(0, 200)
+    ax.set_zlim(-2, 2)
+    ax.set_xticks([0, 50, 100, 150, 200])
+    ax.set_yticks([0, 50, 100, 150, 200])
+    ax.set_zticks([-2, -1, 0, 1, 2])
+    ax.legend(loc=(0.62,0.77))
+    ax.view_init(elev=45, azim=-50)
+    plt.show()
 
 ################################################################################################
 # We can also plot the error for each of the 6 DOF, with estimates for our uncertainty
 # included. The error estimates are in blue, and the uncertainty bounds are red and dashed.
 # The uncertainty bounds are +/- 3 standard deviations based on our uncertainty (covariance).
 ################################################################################################
-error_fig, ax = plt.subplots(2, 3)
-error_fig.suptitle('Error Plots')
-num_gt = gt.p.shape[0]
-p_est_euler = []
-p_cov_euler_std = []
+    error_fig, ax = plt.subplots(2, 3)
+    error_fig.suptitle('Error Plots')
+    num_gt = gt.p.shape[0]
+    p_est_euler = []
+    p_cov_euler_std = []
 
-# Convert estimated quaternions to euler angles
-for i in range(len(q_est)):
-    qc = Quaternion(*q_est[i, :])
-    p_est_euler.append(qc.to_euler())
+    # Convert estimated quaternions to euler angles
+    for i in range(len(q_est)):
+        qc = Quaternion(*q_est[i, :])
+        p_est_euler.append(qc.to_euler())
 
-    # First-order approximation of RPY covariance
-    J = rpy_jacobian_axis_angle(qc.to_axis_angle())
-    p_cov_euler_std.append(np.sqrt(np.diagonal(J @ p_cov[i, 6:, 6:] @ J.T)))
+        # First-order approximation of RPY covariance
+        J = rpy_jacobian_axis_angle(qc.to_axis_angle())
+        p_cov_euler_std.append(np.sqrt(np.diagonal(J @ p_cov[i, 6:, 6:] @ J.T)))
 
-p_est_euler = np.array(p_est_euler)
-p_cov_euler_std = np.array(p_cov_euler_std)
+    p_est_euler = np.array(p_est_euler)
+    p_cov_euler_std = np.array(p_cov_euler_std)
 
-# Get uncertainty estimates from P matrix
-p_cov_std = np.sqrt(np.diagonal(p_cov[:, :6, :6], axis1=1, axis2=2))
+    # Get uncertainty estimates from P matrix
+    p_cov_std = np.sqrt(np.diagonal(p_cov[:, :6, :6], axis1=1, axis2=2))
 
-titles = ['Easting', 'Northing', 'Up', 'Roll', 'Pitch', 'Yaw']
-for i in range(3):
-    ax[0, i].plot(range(num_gt), gt.p[:, i] - p_est[:num_gt, i])
-    ax[0, i].plot(range(num_gt),  3 * p_cov_std[:num_gt, i], 'r--')
-    ax[0, i].plot(range(num_gt), -3 * p_cov_std[:num_gt, i], 'r--')
-    ax[0, i].set_title(titles[i])
-ax[0,0].set_ylabel('Meters')
+    titles = ['Easting', 'Northing', 'Up', 'Roll', 'Pitch', 'Yaw']
+    for i in range(3):
+        ax[0, i].plot(range(num_gt), gt.p[:, i] - p_est[:num_gt, i])
+        ax[0, i].plot(range(num_gt),  3 * p_cov_std[:num_gt, i], 'r--')
+        ax[0, i].plot(range(num_gt), -3 * p_cov_std[:num_gt, i], 'r--')
+        ax[0, i].set_title(titles[i])
+    ax[0,0].set_ylabel('Meters')
 
-for i in range(3):
-    ax[1, i].plot(range(num_gt), \
-        angle_normalize(gt.r[:, i] - p_est_euler[:num_gt, i]))
-    ax[1, i].plot(range(num_gt),  3 * p_cov_euler_std[:num_gt, i], 'r--')
-    ax[1, i].plot(range(num_gt), -3 * p_cov_euler_std[:num_gt, i], 'r--')
-    ax[1, i].set_title(titles[i+3])
-ax[1,0].set_ylabel('Radians')
-plt.show()
+    for i in range(3):
+        ax[1, i].plot(range(num_gt), \
+            angle_normalize(gt.r[:, i] - p_est_euler[:num_gt, i]))
+        ax[1, i].plot(range(num_gt),  3 * p_cov_euler_std[:num_gt, i], 'r--')
+        ax[1, i].plot(range(num_gt), -3 * p_cov_euler_std[:num_gt, i], 'r--')
+        ax[1, i].set_title(titles[i+3])
+    ax[1,0].set_ylabel('Radians')
+    plt.show()
 
 #### 7. Submission #############################################################################
 
@@ -242,13 +288,13 @@ plt.show()
 ################################################################################################
 
 # Pt. 1 submission
-p1_indices = [9000, 9400, 9800, 10200, 10600]
-p1_str = ''
-for val in p1_indices:
-    for i in range(3):
-        p1_str += '%.3f ' % (p_est[val, i])
-with open('pt1_submission.txt', 'w') as file:
-    file.write(p1_str)
+# p1_indices = [9000, 9400, 9800, 10200, 10600]
+# p1_str = ''
+# for val in p1_indices:
+#     for i in range(3):
+#         p1_str += '%.3f ' % (p_est[val, i])
+# with open('pt1_submission.txt', 'w') as file:
+#     file.write(p1_str)
 
 # Pt. 2 submission
 # p2_indices = [9000, 9400, 9800, 10200, 10600]
