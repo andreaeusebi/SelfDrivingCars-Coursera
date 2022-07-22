@@ -1,4 +1,5 @@
 from numpy import *
+import math 
 
 def sph_to_cart(epsilon, alpha, r):
   """
@@ -11,9 +12,9 @@ def sph_to_cart(epsilon, alpha, r):
   
   # Your code here
 
-  p[0] = r * cos(alpha) * cos(epsilon)
-  p[1] = r * sin(alpha) * cos(epsilon)
-  p[2] = r * sin(epsilon)
+  p[0] = r * math.cos(alpha) * math.cos(epsilon)
+  p[1] = r * math.sin(alpha) * math.cos(epsilon)
+  p[2] = r * math.sin(epsilon)
 
   return p
   
@@ -35,6 +36,7 @@ def estimate_params(P):
   three, in the order [a, b, c].
   """
   param_est = zeros(3)
+  print(param_est)
   
   # Your code here
   P_rows, P_columns = P.shape
@@ -42,12 +44,16 @@ def estimate_params(P):
 
   A[:,1] = P[:,0]
   A[:,2] = P[:,1]
+  
+  print(A)
 
   b = zeros((P_rows,1))
+  b = P[:,2]
+  
+  print(b)
 
   param_est = linalg.inv(A.T @ A) @ A.T @ b
 
   print('test')
   
   return param_est
-  
